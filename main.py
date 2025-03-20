@@ -241,43 +241,46 @@ class AutonomousAgent:
         failure_info = ""
         if task.failure_reason and task.retry_count > 0:
             failure_info = f"""
-이 태스크는 이전에 {task.retry_count}번 실패했습니다.
-실패 이유: {task.failure_reason}
+This task has failed {task.retry_count} times before.
+Failure reason: {task.failure_reason}
 
-이전 실패를 고려하여 다른 접근 방식을 시도하세요.
+Consider trying a different approach based on the previous failures.
 """
 
         prompt = f"""
-당신은 태스크를 분석하여 실행 계획을 세우는 에이전트입니다.
-다음 태스크를 분석하고, 두 가지 중 하나를 선택하세요:
-1. 태스크를 더 작은 서브태스크로 분할
-2. 사용 가능한 도구를 사용하여 태스크를 직접 실행
+You are an agent responsible for analyzing tasks and creating execution plans.
+Analyze the given task and choose one of the following two options:
+1. Decompose the task into smaller subtasks.
+2. Use an available tool to execute the task directly.
 
-태스크: {task.description}
+Task: {task.description}
 
-사용 가능한 도구: {', '.join(available_tools)}
+Available tools: {', '.join(available_tools)}
 {failure_info}
 
-이전에 생성된 서브태스크 목록 (재사용 가능):
+Previously generated subtasks (available for reuse):
 {reusable_subtasks_text if reusable_subtasks else ""}
 
-재사용 지침:
-- 가능한 한 기존 서브태스크를 재사용하여 중복을 최소화하세요.
-- 이전에 생성된 서브태스크와 유사한 작업을 해야 한다면, 정확히 같은 설명을 사용하세요.
-- 새로운 서브태스크를 만들 때는 나중에 재사용할 수 있도록 일반적인 형태로 작성하세요.
+Reuse guidelines:
+- Minimize duplication by reusing existing subtasks whenever possible.
+- If a new subtask is similar to an existing one, use the exact same description.
+- When creating new subtasks, write them in a general format to allow for future reuse.
 
-응답은 다음 JSON 형식으로 제공하세요:
+Provide your response in the following JSON format:
+
 ```
 {{
-    "task_type": "decomposition 또는 execution",
-    "reasoning": "당신의 결정에 대한 이유",
-    "subtasks": ["서브태스크 1", "서브태스크 2", ...] // task_type이 decomposition인 경우에만
-    "tool": "도구명", // task_type이 execution인 경우에만
-    "tool_args": {{}} // task_type이 execution인 경우에만
+    "task_type": "decomposition or execution",
+    "reasoning": "Your reasoning for the decision",
+    "subtasks": ["Subtask 1", "Subtask 2", ...] // Only for task_type = decomposition
+    "tool": "Tool name", // Only for task_type = execution
+    "tool_args": {{}} // Only for task_type = execution
 }}
 ```
 
-정확한 JSON 형식으로 응답해주세요.
+Ensure the response is in a valid JSON format.
+Do not use comments, and `subtasks` must be a list of strings.
+Do not use placeholders—provide actual values. Whenever possible, use the given tools to complete the task.
 """
         return prompt
 
@@ -314,14 +317,19 @@ class AutonomousAgent:
                 if not all(
                     isinstance(subtask, str) for subtask in analysis["subtasks"]
                 ):
+                    wrong_subtasks = [
+                        subtask
+                        for subtask in analysis["subtasks"]
+                        if not isinstance(subtask, str)
+                    ]
                     return {
                         "task_type": "execution",
-                        "reasoning": "서브태스크는 문자열 목록이어야 함",
+                        "reasoning": f"서브태스크는 문자열 목록이어야 함: 위반: {wrong_subtasks}",
                         "tool": "echo",
                         "tool_args": {
-                            "message": "태스크 분석 실패: 서브태스크 형식 오류"
+                            "message": f"서브태스크는 문자열 목록이어야 함: 위반: {wrong_subtasks}"
                         },
-                        "error": "태스크 분석 실패: 서브태스크는 문자열 목록이어야 함",
+                        "error": f"태스크 분석 실패: 서브태스크는 문자열 목록이어야 함; 위반: {wrong_subtasks}",
                     }, False
 
             elif analysis.get("task_type") == "execution":
@@ -402,7 +410,7 @@ class AutonomousAgent:
 
             if not success:
                 # 분석 실패 처리
-                failure_reason = "태스크 분석 실패: 유효하지 않은 task_type"
+                failure_reason = f"태스크 분석 실패: {analysis.get('error')}"
                 retry_count = next_task.retry_count + 1
 
                 if retry_count <= max_retries:
