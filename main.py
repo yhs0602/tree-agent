@@ -266,7 +266,7 @@ class AutonomousAgent:
                     next_task.task_id, status=TaskStatus.COMPLETED
                 )
                 print(
-                    f"태스크 분해: {next_task.description} -> {len(subtasks)}개의 서브태스크"
+                    f"태스크 분해: {next_task.description} -> {len(subtasks)}개의 서브태스크: {subtasks}"
                 )
 
             elif task_type == "execution":
@@ -319,7 +319,7 @@ def fetch_web_content(url: str) -> Dict:
 # 메인 실행 코드
 def main():
     # LLM 클라이언트 초기화 (Ollama 사용)
-    llm_client = LLMClient(api_url="http://localhost:11434", model="llama3")
+    llm_client = LLMClient(api_url="http://localhost:11434", model="phi4-mini:latest")
 
     # 도구 레지스트리 초기화 및 도구 등록
     tool_registry = ToolRegistry()
