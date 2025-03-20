@@ -33,6 +33,8 @@ class Task:
     result: Any = None
     tool_name: Optional[str] = None
     tool_args: Optional[Dict] = None
+    failure_reason: Optional[str] = None  # 실패 이유 추가
+    retry_count: int = 0  # 재시도 횟수 추가
 
     # 태스크 해시 생성 (중복 감지용)
     @property
@@ -195,7 +197,10 @@ class TaskManager:
                     task_scores.append((score, task))
 
         # 유사도 기준으로 정렬하여 상위 N개 반환
-        similar_tasks = [task for _, task in sorted(task_scores, reverse=True)[:limit]]
+        similar_tasks = [
+            task
+            for _, task in sorted(task_scores, key=lambda x: x[0], reverse=True)[:limit]
+        ]
         return similar_tasks
 
 
@@ -232,6 +237,16 @@ class AutonomousAgent:
             [f"- {subtask}" for subtask in reusable_subtasks]
         )
 
+        # 이전 실패 정보 추가
+        failure_info = ""
+        if task.failure_reason and task.retry_count > 0:
+            failure_info = f"""
+이 태스크는 이전에 {task.retry_count}번 실패했습니다.
+실패 이유: {task.failure_reason}
+
+이전 실패를 고려하여 다른 접근 방식을 시도하세요.
+"""
+
         prompt = f"""
 당신은 태스크를 분석하여 실행 계획을 세우는 에이전트입니다.
 다음 태스크를 분석하고, 두 가지 중 하나를 선택하세요:
@@ -241,10 +256,10 @@ class AutonomousAgent:
 태스크: {task.description}
 
 사용 가능한 도구: {', '.join(available_tools)}
-
+{failure_info}
 
 이전에 생성된 서브태스크 목록 (재사용 가능):
-  {reusable_subtasks_text if reusable_subtasks else ""}
+{reusable_subtasks_text if reusable_subtasks else ""}
 
 재사용 지침:
 - 가능한 한 기존 서브태스크를 재사용하여 중복을 최소화하세요.
@@ -281,27 +296,78 @@ class AutonomousAgent:
 
             analysis = json.loads(response.strip())
 
-            if analysis["subtasks"]:
+            # 응답 유효성 검증
+            if analysis.get("task_type") == "decomposition":
+                if not analysis.get("subtasks") or not isinstance(
+                    analysis["subtasks"], list
+                ):
+                    return {
+                        "task_type": "execution",
+                        "reasoning": "서브태스크가 없거나 유효하지 않음",
+                        "tool": "echo",
+                        "tool_args": {
+                            "message": "태스크 분석 실패: 유효하지 않은 서브태스크"
+                        },
+                        "error": "태스크 분석 실패: 서브태스크가 없거나 유효하지 않음",
+                    }, False
+
                 if not all(
                     isinstance(subtask, str) for subtask in analysis["subtasks"]
                 ):
-                    print("[Error]: 서브태스크는 문자열 목록이어야 함")
                     return {
                         "task_type": "execution",
                         "reasoning": "서브태스크는 문자열 목록이어야 함",
                         "tool": "echo",
-                        "tool_args": {"message": "태스크 분석 실패"},
+                        "tool_args": {
+                            "message": "태스크 분석 실패: 서브태스크 형식 오류"
+                        },
+                        "error": "태스크 분석 실패: 서브태스크는 문자열 목록이어야 함",
                     }, False
+
+            elif analysis.get("task_type") == "execution":
+                if not analysis.get("tool"):
+                    return {
+                        "task_type": "execution",
+                        "reasoning": "도구 이름이 지정되지 않음",
+                        "tool": "echo",
+                        "tool_args": {"message": "태스크 분석 실패: 도구 이름 누락"},
+                        "error": "태스크 분석 실패: 도구 이름이 지정되지 않음",
+                    }, False
+
+                if analysis.get("tool") not in self.tool_registry.tools:
+                    return {
+                        "task_type": "execution",
+                        "reasoning": f"도구 '{analysis.get('tool')}'이(가) 등록되지 않음",
+                        "tool": "echo",
+                        "tool_args": {
+                            "message": f"태스크 분석 실패: 없는 도구 '{analysis.get('tool')}'"
+                        },
+                        "error": f"태스크 분석 실패: 도구 '{analysis.get('tool')}'이(가) 등록되지 않음",
+                    }, False
+
+            else:
+                return {
+                    "task_type": "execution",
+                    "reasoning": "유효하지 않은 task_type",
+                    "tool": "echo",
+                    "tool_args": {
+                        "message": "태스크 분석 실패: task_type은 'decomposition' 또는 'execution'이어야 함"
+                    },
+                    "error": "태스크 분석 실패: task_type은 'decomposition' 또는 'execution'이어야 함",
+                }, False
+
             return analysis, True
+
         except json.JSONDecodeError as e:
             print(f"JSON 파싱 오류: {e}")
             print(f"원본 응답: {response}")
             # 기본값 반환
             return {
                 "task_type": "execution",
-                "reasoning": "응답을 파싱할 수 없음",
+                "reasoning": f"JSON 파싱 오류: {e}",
                 "tool": "echo",
-                "tool_args": {"message": "태스크 분석 실패"},
+                "tool_args": {"message": f"태스크 분석 실패: JSON 파싱 오류 - {e}"},
+                "error": f"태스크 분석 실패: JSON 파싱 오류 - {e}",
             }, False
 
     def execute_task(self, task: Task) -> Any:
@@ -315,7 +381,7 @@ class AutonomousAgent:
         except Exception as e:
             return {"error": str(e)}
 
-    def run(self, initial_task: str):
+    def run(self, initial_task: str, max_retries: int = 3):
         """에이전트 실행"""
         # 초기 태스크 생성
         root_task_id = self.task_manager.create_task(initial_task)
@@ -333,6 +399,33 @@ class AutonomousAgent:
 
             # 태스크 분석
             analysis, success = self.analyze_task(next_task)
+
+            if not success:
+                # 분석 실패 처리
+                failure_reason = "태스크 분석 실패: 유효하지 않은 task_type"
+                retry_count = next_task.retry_count + 1
+
+                if retry_count <= max_retries:
+                    self.task_manager.update_task(
+                        next_task.task_id,
+                        status=TaskStatus.PENDING,
+                        failure_reason=failure_reason,
+                        retry_count=retry_count,
+                    )
+                    print(
+                        f"태스크 분석 실패: {next_task.description}. 재시도 {retry_count}/{max_retries} ({failure_reason})"
+                    )
+                else:
+                    self.task_manager.update_task(
+                        next_task.task_id,
+                        status=TaskStatus.FAILED,
+                        failure_reason=failure_reason,
+                    )
+                    print(
+                        f"태스크 분석 최종 실패: {next_task.description}. 최대 재시도 횟수 초과"
+                    )
+                continue
+
             task_type = analysis.get("task_type")
 
             if task_type == "decomposition":
@@ -367,23 +460,39 @@ class AutonomousAgent:
                 result = self.execute_task(next_task)
 
                 # 결과 저장 및 태스크 완료로 표시
-                if success:
-                    self.task_manager.update_task(
-                        next_task.task_id,
-                        result=result,
-                        status=(
-                            TaskStatus.COMPLETED
-                            if "error" not in result
-                            else TaskStatus.FAILED
-                        ),
-                    )
-                else:
-                    print(f"태스크 실패: {next_task.description}. 재시도 필요")
-                    self.task_manager.update_task(
-                        next_task.task_id, status=TaskStatus.PENDING
-                    )
+                if "error" in result:
+                    # 실패 처리
+                    failure_reason = f"도구 실행 오류: {result['error']}"
+                    retry_count = next_task.retry_count + 1
 
-                print(f"태스크 실행: {next_task.description} -> {result}")
+                    if retry_count <= max_retries:
+                        # 재시도를 위해 상태를 PENDING으로 설정하고 실패 이유 기록
+                        self.task_manager.update_task(
+                            next_task.task_id,
+                            status=TaskStatus.PENDING,
+                            failure_reason=failure_reason,
+                            retry_count=retry_count,
+                        )
+                        print(
+                            f"태스크 실패: {next_task.description}. 재시도 {retry_count}/{max_retries}. 이유: {failure_reason}"
+                        )
+                    else:
+                        # 최대 재시도 횟수 초과
+                        self.task_manager.update_task(
+                            next_task.task_id,
+                            result=result,
+                            status=TaskStatus.FAILED,
+                            failure_reason=failure_reason,
+                        )
+                        print(
+                            f"태스크 최종 실패: {next_task.description}. 최대 재시도 횟수 초과. 이유: {failure_reason}"
+                        )
+                else:
+                    # 성공 처리
+                    self.task_manager.update_task(
+                        next_task.task_id, result=result, status=TaskStatus.COMPLETED
+                    )
+                    print(f"태스크 실행 성공: {next_task.description}")
 
         # 최종 결과 반환
         return self.task_manager.get_task_tree()
