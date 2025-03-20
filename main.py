@@ -1,12 +1,13 @@
 import json
 import uuid
 import requests
-from typing import Dict, List, Any, Optional, Union
-from dataclasses import dataclass, asdict
+from typing import Dict, List, Any, Optional, Tuple, Union, Set
+from dataclasses import dataclass, asdict, field
 from enum import Enum
+import hashlib
 
 
-# 태스크 상태 열거형
+# 태스크 상태 열거형 (JSON 직렬화 가능)
 class TaskStatus(str, Enum):
     PENDING = "pending"
     IN_PROGRESS = "in_progress"
@@ -14,7 +15,7 @@ class TaskStatus(str, Enum):
     FAILED = "failed"
 
 
-# 태스크 타입 열거형
+# 태스크 타입 열거형 (JSON 직렬화 가능)
 class TaskType(str, Enum):
     EXECUTION = "execution"  # 직접 실행 가능한 태스크
     DECOMPOSITION = "decomposition"  # 분해가 필요한 태스크
@@ -28,14 +29,23 @@ class Task:
     status: TaskStatus
     type: Optional[TaskType] = None
     parent_id: Optional[str] = None
-    children_ids: List[str] = None
+    children_ids: List[str] = field(default_factory=list)
     result: Any = None
     tool_name: Optional[str] = None
     tool_args: Optional[Dict] = None
 
-    def __post_init__(self):
-        if self.children_ids is None:
-            self.children_ids = []
+    # 태스크 해시 생성 (중복 감지용)
+    @property
+    def hash(self) -> str:
+        return hashlib.md5(self.description.lower().strip().encode()).hexdigest()
+
+
+# JSON 직렬화 가능한 Enum을 위한 인코더
+class EnumEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, Enum):
+            return obj.value
+        return super().default(obj)
 
 
 # 로컬 LLM 클라이언트
@@ -79,20 +89,35 @@ class ToolRegistry:
 class TaskManager:
     def __init__(self):
         self.tasks = {}  # task_id -> Task
+        self.task_hashes = {}  # task_hash -> task_id (중복 감지용)
         self.root_tasks = []  # 최상위 태스크 ID 목록
 
     def create_task(self, description: str, parent_id: Optional[str] = None) -> str:
-        """새 태스크 생성"""
-        task_id = str(uuid.uuid4())
-        task = Task(
-            task_id=task_id,
-            description=description,
-            status=TaskStatus.PENDING,
-            parent_id=parent_id,
-        )
-        self.tasks[task_id] = task
+        """새 태스크 생성 (중복 감지 및 재사용)"""
+        # 태스크 설명에서 해시 생성
+        task_hash = hashlib.md5(description.lower().strip().encode()).hexdigest()
 
+        # 이미 존재하는 태스크인지 확인
+        if task_hash in self.task_hashes:
+            existing_task_id = self.task_hashes[task_hash]
+
+            # 부모 태스크가 있는 경우 자식으로 연결
+            if parent_id:
+                parent_task = self.tasks.get(parent_id)
+                if parent_task and existing_task_id not in parent_task.children_ids:
+                    parent_task.children_ids.append(existing_task_id)
+
+            return existing_task_id
+
+        # 새 태스크 생성
+        task_id = str(uuid.uuid4())
+        task = Task(task_id=task_id, description=description, status=TaskStatus.PENDING)
+        self.tasks[task_id] = task
+        self.task_hashes[task_hash] = task_id
+
+        # 부모-자식 관계 설정
         if parent_id:
+            task.parent_id = parent_id
             parent_task = self.tasks.get(parent_id)
             if parent_task:
                 parent_task.children_ids.append(task_id)
@@ -155,6 +180,24 @@ class TaskManager:
 
         return [build_tree(root_id) for root_id in self.root_tasks]
 
+    def get_similar_tasks(self, description: str, limit: int = 5) -> List[Task]:
+        """유사한 태스크 찾기 (단순 키워드 매칭)"""
+        keywords = set(description.lower().split())
+        task_scores = []
+
+        for task_id, task in self.tasks.items():
+            if task.status == TaskStatus.COMPLETED:
+                task_keywords = set(task.description.lower().split())
+                common_words = keywords.intersection(task_keywords)
+                score = len(common_words) / max(len(keywords), len(task_keywords))
+
+                if score > 0.2:  # 일정 유사도 이상인 경우만
+                    task_scores.append((score, task))
+
+        # 유사도 기준으로 정렬하여 상위 N개 반환
+        similar_tasks = [task for _, task in sorted(task_scores, reverse=True)[:limit]]
+        return similar_tasks
+
 
 # 자율 에이전트
 class AutonomousAgent:
@@ -168,6 +211,27 @@ class AutonomousAgent:
         # 사용 가능한 도구 목록
         available_tools = list(self.tool_registry.tools.keys())
 
+        # 유사한 태스크 목록 (재사용 가능한 서브태스크 제안)
+        similar_tasks = self.task_manager.get_similar_tasks(task.description)
+
+        # 유사한 태스크의 분해 결과 추출
+        reusable_subtasks = []
+        for similar_task in similar_tasks:
+            if similar_task.type == TaskType.DECOMPOSITION:
+                child_tasks = [
+                    self.task_manager.get_task(child_id).description
+                    for child_id in similar_task.children_ids
+                ]
+                reusable_subtasks.extend(child_tasks)
+
+        # 중복 제거하고 최대 10개 유지
+        reusable_subtasks = list(set(reusable_subtasks))[:10]
+
+        # 이미 생성된 서브태스크 목록을 프롬프트에 추가
+        reusable_subtasks_text = "\n".join(
+            [f"- {subtask}" for subtask in reusable_subtasks]
+        )
+
         prompt = f"""
 당신은 태스크를 분석하여 실행 계획을 세우는 에이전트입니다.
 다음 태스크를 분석하고, 두 가지 중 하나를 선택하세요:
@@ -177,6 +241,15 @@ class AutonomousAgent:
 태스크: {task.description}
 
 사용 가능한 도구: {', '.join(available_tools)}
+
+
+이전에 생성된 서브태스크 목록 (재사용 가능):
+  {reusable_subtasks_text if reusable_subtasks else ""}
+
+재사용 지침:
+- 가능한 한 기존 서브태스크를 재사용하여 중복을 최소화하세요.
+- 이전에 생성된 서브태스크와 유사한 작업을 해야 한다면, 정확히 같은 설명을 사용하세요.
+- 새로운 서브태스크를 만들 때는 나중에 재사용할 수 있도록 일반적인 형태로 작성하세요.
 
 응답은 다음 JSON 형식으로 제공하세요:
 ```
@@ -193,7 +266,7 @@ class AutonomousAgent:
 """
         return prompt
 
-    def analyze_task(self, task: Task) -> Dict:
+    def analyze_task(self, task: Task) -> Tuple[Dict, bool]:
         """LLM을 사용하여 태스크 분석"""
         prompt = self._create_task_analysis_prompt(task)
         response = self.llm_client.query(prompt)
@@ -207,7 +280,19 @@ class AutonomousAgent:
                     response = response[4:]
 
             analysis = json.loads(response.strip())
-            return analysis
+
+            if analysis["subtasks"]:
+                if not all(
+                    isinstance(subtask, str) for subtask in analysis["subtasks"]
+                ):
+                    print("[Error]: 서브태스크는 문자열 목록이어야 함")
+                    return {
+                        "task_type": "execution",
+                        "reasoning": "서브태스크는 문자열 목록이어야 함",
+                        "tool": "echo",
+                        "tool_args": {"message": "태스크 분석 실패"},
+                    }, False
+            return analysis, True
         except json.JSONDecodeError as e:
             print(f"JSON 파싱 오류: {e}")
             print(f"원본 응답: {response}")
@@ -217,7 +302,7 @@ class AutonomousAgent:
                 "reasoning": "응답을 파싱할 수 없음",
                 "tool": "echo",
                 "tool_args": {"message": "태스크 분석 실패"},
-            }
+            }, False
 
     def execute_task(self, task: Task) -> Any:
         """도구를 사용하여 태스크 실행"""
@@ -247,7 +332,7 @@ class AutonomousAgent:
             )
 
             # 태스크 분석
-            analysis = self.analyze_task(next_task)
+            analysis, success = self.analyze_task(next_task)
             task_type = analysis.get("task_type")
 
             if task_type == "decomposition":
@@ -256,7 +341,7 @@ class AutonomousAgent:
                     next_task.task_id, type=TaskType.DECOMPOSITION
                 )
 
-                # 서브태스크 생성
+                # 서브태스크 생성 (중복 감지 및 재사용)
                 subtasks = analysis.get("subtasks", [])
                 for subtask in subtasks:
                     self.task_manager.create_task(subtask, parent_id=next_task.task_id)
@@ -282,15 +367,21 @@ class AutonomousAgent:
                 result = self.execute_task(next_task)
 
                 # 결과 저장 및 태스크 완료로 표시
-                self.task_manager.update_task(
-                    next_task.task_id,
-                    result=result,
-                    status=(
-                        TaskStatus.COMPLETED
-                        if "error" not in result
-                        else TaskStatus.FAILED
-                    ),
-                )
+                if success:
+                    self.task_manager.update_task(
+                        next_task.task_id,
+                        result=result,
+                        status=(
+                            TaskStatus.COMPLETED
+                            if "error" not in result
+                            else TaskStatus.FAILED
+                        ),
+                    )
+                else:
+                    print(f"태스크 실패: {next_task.description}. 재시도 필요")
+                    self.task_manager.update_task(
+                        next_task.task_id, status=TaskStatus.PENDING
+                    )
 
                 print(f"태스크 실행: {next_task.description} -> {result}")
 
@@ -316,6 +407,29 @@ def fetch_web_content(url: str) -> Dict:
         return {"status": "error", "error": str(e)}
 
 
+def parse_html(html_content: str, selector: str = None) -> Dict:
+    try:
+        from bs4 import BeautifulSoup
+
+        soup = BeautifulSoup(html_content, "html.parser")
+
+        if selector:
+            elements = soup.select(selector)
+            return {
+                "status": "success",
+                "elements": [str(el) for el in elements[:5]],
+                "count": len(elements),
+            }
+        else:
+            return {
+                "status": "success",
+                "title": soup.title.string if soup.title else "No title",
+                "text": soup.get_text()[:500] + "...",
+            }
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
 # 메인 실행 코드
 def main():
     # LLM 클라이언트 초기화 (Ollama 사용)
@@ -326,19 +440,20 @@ def main():
     tool_registry.register_tool("echo", echo)
     tool_registry.register_tool("add", add)
     tool_registry.register_tool("fetch_web_content", fetch_web_content)
+    tool_registry.register_tool("parse_html", parse_html)
 
     # 에이전트 초기화
     agent = AutonomousAgent(llm_client, tool_registry)
 
     # 초기 태스크
-    initial_task = "웹에서 최신 파이썬 라이브러리 정보를 찾아서 요약해줘"
+    initial_task = "파이썬 라이브러리 정보를 찾기 위해 Python.org와 PyPi.org를 조사하고 결과를 요약해줘"
 
     # 에이전트 실행
     result = agent.run(initial_task)
 
-    # 결과 출력
+    # 결과 출력 (EnumEncoder 사용)
     print("\n=== 최종 태스크 트리 ===")
-    print(json.dumps(result, indent=2, ensure_ascii=False))
+    print(json.dumps(result, indent=2, ensure_ascii=False, cls=EnumEncoder))
 
 
 if __name__ == "__main__":
