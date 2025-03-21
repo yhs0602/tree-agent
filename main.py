@@ -1,4 +1,5 @@
 import json
+import re
 import uuid
 import requests
 from typing import Dict, List, Any, Optional, Tuple, Union, Set
@@ -291,11 +292,18 @@ Do not use placeholders—provide actual values. Whenever possible, use the give
 
         # JSON 응답 추출 및 파싱
         try:
+            # Think token 제거
+            response = re.sub(
+                r"<think>.*?</think>", "", response, flags=re.DOTALL
+            ).strip()
             # JSON 응답이 ```로 감싸져 있을 경우 처리
             if "```json" in response or "```" in response:
                 response = response.split("```")[1]
                 if response.startswith("json"):
                     response = response[4:]
+            else:
+                # 코드 블록이 없고 전체가 JSON이라고 가정
+                response = response.strip()
 
             analysis = json.loads(response.strip())
 
@@ -550,7 +558,7 @@ def parse_html(html_content: str, selector: str = None) -> Dict:
 # 메인 실행 코드
 def main():
     # LLM 클라이언트 초기화 (Ollama 사용)
-    llm_client = LLMClient(api_url="http://localhost:11434", model="phi4-mini:latest")
+    llm_client = LLMClient(api_url="http://localhost:11434", model="qwq4-4bit:latest")
 
     # 도구 레지스트리 초기화 및 도구 등록
     tool_registry = ToolRegistry()
